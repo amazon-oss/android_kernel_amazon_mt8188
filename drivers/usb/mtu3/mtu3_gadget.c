@@ -330,6 +330,7 @@ static int mtu3_gadget_queue(struct usb_ep *ep,
 	spin_lock_irqsave(&mtu->lock, flags);
 
 	if (mtu3_prepare_transfer(mep)) {
+		dev_info(mtu->dev, "prepare transfer failed\n");
 		ret = -EAGAIN;
 		usb_gadget_unmap_request(&mtu->g, req, mep->is_in);
 		goto error;
