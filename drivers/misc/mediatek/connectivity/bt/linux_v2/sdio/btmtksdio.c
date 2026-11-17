@@ -29,6 +29,10 @@ static DEFINE_MUTEX(btmtk_sdio_debug_mutex);
 #define SDIO_DEBUG_MUTEX_LOCK()	mutex_lock(&btmtk_sdio_debug_mutex)
 #define SDIO_DEBUG_MUTEX_UNLOCK()	mutex_unlock(&btmtk_sdio_debug_mutex)
 
+static DEFINE_MUTEX(btmtk_sdio_thread_mutex);
+#define SDIO_THREAD_MUTEX_LOCK()	mutex_lock(&btmtk_sdio_thread_mutex)
+#define SDIO_THREAD_MUTEX_UNLOCK()	mutex_unlock(&btmtk_sdio_thread_mutex)
+
 static int btmtk_sdio_readl(u32 offset,  u32 *val, struct sdio_func *func);
 static int btmtk_sdio_writel(u32 offset, u32 val, struct sdio_func *func);
 
@@ -1639,6 +1643,9 @@ static u32 btmtk_thread_wait_for_msg(struct btmtk_sdio_dev *cif_dev)
 {
 	u32 ret = 0;
 
+	if (READ_ONCE(cif_dev->suspended))
+		return kthread_should_stop() ? BTMTK_SDIO_THREAD_STOP : 0;
+
 	if (!skb_queue_empty(&cif_dev->tx_queue) && (atomic_read(&cif_dev->tx_rdy))) {
 		BTMTK_DBG("tx queue is not empty");
 		ret |= BTMTK_SDIO_THREAD_TX;
@@ -1782,10 +1789,17 @@ static int btmtk_sdio_main_thread(void *data)
 		}
 		BTMTK_DBG("btmtk_sdio_main_thread doing...");
 
+		SDIO_THREAD_MUTEX_LOCK();
+		if (cif_dev->suspended) {
+			SDIO_THREAD_MUTEX_UNLOCK();
+			continue;
+		}
+
 		if (thread_flag & BTMTK_SDIO_THREAD_FW_OWN) {
 			ret = btmtk_sdio_set_fw_own(cif_dev, RETRY_TIMES);
 			if (ret) {
 				BTMTK_ERR("set fw own return fail");
+				SDIO_THREAD_MUTEX_UNLOCK();
 				btmtk_reset_trigger(bdev);
 				break;
 			}
@@ -1795,6 +1809,7 @@ static int btmtk_sdio_main_thread(void *data)
 			ret = btmtk_sdio_set_driver_own(cif_dev, RETRY_TIMES);
 			if (ret) {
 				BTMTK_ERR("set driver own return fail");
+				SDIO_THREAD_MUTEX_UNLOCK();
 				btmtk_reset_trigger(bdev);
 				break;
 			}
@@ -1805,6 +1820,7 @@ static int btmtk_sdio_main_thread(void *data)
 			BTMTK_DBG("go int");
 			atomic_set(&cif_dev->int_count, 0);
 			if (btmtk_sdio_interrupt_process(bdev)) {
+				SDIO_THREAD_MUTEX_UNLOCK();
 				btmtk_reset_trigger(bdev);
 				break;
 			}
@@ -1820,11 +1836,14 @@ static int btmtk_sdio_main_thread(void *data)
 				ret = btmtk_tx_pkt(cif_dev, skb);
 				if (ret) {
 					BTMTK_ERR("tx pkt return fail %d", ret);
+					SDIO_THREAD_MUTEX_UNLOCK();
 					btmtk_reset_trigger(bdev);
 					break;
 				}
 			}
 		}
+
+		SDIO_THREAD_MUTEX_UNLOCK();
 	}
 
 	atomic_set(&cif_dev->sdio_thread.thread_status, 0);
@@ -1898,6 +1917,7 @@ static int btmtk_sdio_probe(struct sdio_func *func,
 	skb_queue_head_init(&cif_dev->tx_queue);
 	atomic_set(&cif_dev->int_count, 0);
 	atomic_set(&cif_dev->tx_rdy, 1);
+	cif_dev->suspended = false;
 	cif_dev->sdio_thread.task = kthread_run(btmtk_sdio_main_thread,
 				bdev, "btmtk_sdio_main_thread");
 	if (IS_ERR(cif_dev->sdio_thread.task)) {
@@ -2261,6 +2281,12 @@ static int btmtk_cif_suspend(struct device *dev)
 	else
 		btmtk_set_chip_state((void *)bdev, cif_state->ops_error);
 
+	if (ret == 0) {
+		SDIO_THREAD_MUTEX_LOCK();
+		cif_dev->suspended = true;
+		SDIO_THREAD_MUTEX_UNLOCK();
+	}
+
 	btmtk_sdio_keep_driver_own(cif_dev, 0);
 	BTMTK_INFO("%s, end. ret = %d", __func__, ret);
 	return ret;
@@ -2296,6 +2322,11 @@ static int btmtk_cif_resume(struct device *dev)
 		BTMTK_INFO("data->suspend_count %d, return 0", bdev->suspend_count);
 		return 0;
 	}
+
+	SDIO_THREAD_MUTEX_LOCK();
+	cif_dev->suspended = false;
+	SDIO_THREAD_MUTEX_UNLOCK();
+	wake_up_interruptible(&cif_dev->sdio_thread.wait_q);
 
 	if (bdev->bt_cfg.support_woble_by_eint) {
 		if (bt_woble->wobt_irq != 0 && atomic_read(&(bt_woble->irq_enable_count)) == 1) {

@@ -156,6 +156,7 @@ struct btmtk_sdio_dev {
 
 	bool patched;
 	bool no_fw_own;
+	bool suspended;
 	atomic_t int_count;
 	atomic_t tx_rdy;
 
